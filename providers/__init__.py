@@ -353,13 +353,23 @@ def _refresh_home_layer(layer: _HomeLayer, home: Path | None, key: str, *, force
 
 
 def _plugin_dir_stamps(home: Path) -> tuple:
-    """mtimes of ``plugins/`` and ``plugins/model-providers/``: they change when a child is added."""
+    """mtimes of ``plugins/``, ``plugins/model-providers/`` and each provider plugin folder in it:
+    they change when a plugin is added, and when one is replaced in place (an installer that swaps
+    the folder, or rewrites its files through renames) — that upgrade must reach a running process
+    too (see ``_import_plugin_dir``)."""
     def stamp(path: Path):
         try:
             return os.stat(path).st_mtime_ns
         except OSError:
             return None
-    return (stamp(home / "plugins"), stamp(home / "plugins" / "model-providers"))
+    providers_dir = home / "plugins" / "model-providers"
+    try:
+        children = tuple(sorted(
+            (child.name, stamp(child)) for child in providers_dir.iterdir()
+            if child.is_dir() and not child.name.startswith(("_", "."))))
+    except OSError:
+        children = ()
+    return (stamp(home / "plugins"), stamp(providers_dir), children)
 
 
 def _user_plugins_dir() -> Path | None:
@@ -453,6 +463,39 @@ def _scan_home_layer(layer: _HomeLayer, key: str) -> None:
         _discovering = prior_discovering
 
 
+# Source fingerprint each user plugin module was imported from (module name → fingerprint), so an
+# in-place upgrade is re-imported instead of being shadowed by the stale module for the life of
+# the process.
+_IMPORTED_FINGERPRINTS: dict[str, tuple] = {}
+_FINGERPRINT_MAX_FILES = 512
+
+
+def _plugin_source_fingerprint(plugin_dir: Path) -> tuple:
+    """``(relative path, size, mtime_ns)`` of the plugin's files, bytecode caches excluded.
+
+    Stat-only and bounded; called only when the plugin dirs' stamps changed (see
+    ``_refresh_home_layer``), never per lookup.
+    """
+    entries: list[tuple] = []
+    try:
+        for root, dirs, files in os.walk(plugin_dir):
+            dirs[:] = sorted(d for d in dirs if d != "__pycache__" and not d.startswith("."))
+            for name in sorted(files):
+                if name.startswith(".") or name.endswith((".pyc", ".pyo")):
+                    continue
+                path = Path(root) / name
+                try:
+                    info = path.stat()
+                except OSError:
+                    continue
+                entries.append((str(path.relative_to(plugin_dir)), info.st_size, info.st_mtime_ns))
+                if len(entries) >= _FINGERPRINT_MAX_FILES:
+                    return tuple(entries)
+    except OSError:
+        pass
+    return tuple(entries)
+
+
 def _user_module_name(plugin_dir: Path, home_key: str) -> str:
     digest = hashlib.sha1(home_key.encode("utf-8")).hexdigest()[:10]
     return f"_hermes_user_provider_{digest}_{plugin_dir.name.replace('-', '_')}"
@@ -488,11 +531,20 @@ def _import_plugin_dir(plugin_dir: Path, source: str, *, home_key: str = "") -> 
     # multiple HERMES_HOME profiles don't alias each other.
     if source == "bundled":
         module_name = f"plugins.model_providers.{plugin_dir.name.replace('-', '_')}"
+        fingerprint = None
     else:
         module_name = _user_module_name(plugin_dir, home_key)
+        fingerprint = _plugin_source_fingerprint(plugin_dir)
 
     if module_name in sys.modules:
-        return  # already imported
+        if fingerprint is None or _IMPORTED_FINGERPRINTS.get(module_name) == fingerprint:
+            return  # already imported, unchanged
+        # Replaced in place since this process imported it (e.g. the Oi connector upgrading its
+        # provider): import the new code, or providers it now registers stay "Unknown provider"
+        # in every long-running process until a restart.
+        logger.info("Provider plugin %s changed on disk; re-importing it", plugin_dir.name)
+        for loaded in [n for n in sys.modules if n == module_name or n.startswith(module_name + ".")]:
+            sys.modules.pop(loaded, None)
 
     _current_source = source
     try:
@@ -504,6 +556,8 @@ def _import_plugin_dir(plugin_dir: Path, source: str, *, home_key: str = "") -> 
         module = importlib.util.module_from_spec(spec)
         sys.modules[module_name] = module
         spec.loader.exec_module(module)
+        if fingerprint is not None:
+            _IMPORTED_FINGERPRINTS[module_name] = fingerprint
     except Exception as exc:
         logger.warning(
             "Failed to load %s provider plugin %s: %s", source, plugin_dir.name, exc
