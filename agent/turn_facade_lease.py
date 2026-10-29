@@ -209,7 +209,11 @@ class DurableTurnLease:
 
         The holder-qualified UPDATE fences a late refresher from a successor lease. The façade's
         finally sets ``stop`` before releasing, so a holder-fenced miss observed after stop is not
-        a loss."""
+        a loss.
+
+        On a managed worker the renewal is an owner RPC: a lost receipt (owner stall, dropped link)
+        is resent inside the store until the authority is nearly spent, so one late reply is not a
+        lost lease; a refusal or a stall past that window still interrupts here."""
         if self.stop.is_set():
             return False
         started = time.time()
@@ -219,10 +223,13 @@ class DurableTurnLease:
         patience = self._authority_deadline - _REFRESH_EXPIRY_MARGIN_S - started
         if patience <= 0:
             return self._stop_on_exhausted_authority()
+        # A managed worker's store resends a renewal whose receipt an owner stall lost; it gets the
+        # whole remaining authority, so only a stall that outlasts the lease (or a refusal) ends it.
+        cap = getattr(type(self.db), "turn_lease_refresh_patience_cap_s", _REFRESH_WRITE_PATIENCE_S)
         try:
             if self.db.refresh_session_turn_lease(
                 self._current_session_id(), self.holder, ttl_seconds=LEASE_TTL_SECONDS,
-                patience_s=min(_REFRESH_WRITE_PATIENCE_S, patience),
+                patience_s=min(cap, patience),
             ):
                 self._authority_deadline = started + LEASE_TTL_SECONDS
                 return None
