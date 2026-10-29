@@ -3,11 +3,11 @@
 Only explicit local compute registrations are enabled here. A delegated child is reserved by
 the owner on its parent's receipt stream (gateway/session_worker_child.py), never registered.
 """
-import asyncio
 import hmac
 import os
 
 from gateway.session_admission import admission_fingerprint
+from gateway.slow_worker_write import timed_worker_write
 from hermes_state_runtime import (
     RuntimeStoreError, _secret_digest, adopt_worker_execution,
     mutate_worker_execution, register_worker_execution,
@@ -62,6 +62,12 @@ def _verify(connection, ref, params, claim):
             raise RuntimeStoreError('permission_denied')
 
 
+def _write_label(operation, params):
+    """What a slow-write report names: never the claim, the payload or a secret."""
+    detail = f":{params['operation']} seq={params['sequence']}" if operation == 'persist' else ''
+    return f"{operation}{detail} execution={str(params.get('execution_id'))[:16]} session={str(params.get('session_id'))[:24]}"
+
+
 async def worker_request(connection, ref, params, *, operation):
     from gateway.session_authorities import require_serving
     require_serving(connection.authority)  # adopt/persist would write with the released epoch
@@ -85,16 +91,17 @@ async def worker_request(connection, ref, params, *, operation):
         authority.authorize(connection.actor, ref, 'worker:adopt')
         if params['kind'] != 'compute':
             raise RuntimeStoreError('unsupported_producer')
-        return await asyncio.to_thread(register_worker_execution, authority.db, epoch=authority.epoch,
-            **scope, kind='compute', adoption_secret=claim, require_idle=True)
+        return await timed_worker_write(_write_label('register', params), register_worker_execution,
+            authority.db, epoch=authority.epoch, **scope, kind='compute', adoption_secret=claim, require_idle=True)
     if 'worker:adopt' not in connection.actor.capabilities:
         raise RuntimeStoreError('permission_denied')
     _verify(connection, ref, params, claim)
     if operation == 'adopt':
-        return await asyncio.to_thread(adopt_worker_execution, authority.db, epoch=authority.epoch,
-                                       **scope, adoption_secret=claim)
-    result = await asyncio.to_thread(mutate_worker_execution, authority.db, epoch=params['epoch'],
-        **scope, sequence=params['sequence'], operation=params['operation'], payload=params['payload'])
+        return await timed_worker_write(_write_label('adopt', params), adopt_worker_execution, authority.db,
+                                        epoch=authority.epoch, **scope, adoption_secret=claim)
+    result = await timed_worker_write(_write_label('persist', params), mutate_worker_execution, authority.db,
+        epoch=params['epoch'], **scope, sequence=params['sequence'], operation=params['operation'],
+        payload=params['payload'])
     if params['operation'] == 'execution.finish':
         # Queued input parked behind this worker; nothing else would restart its FIFO.
         authority.wake_after_worker(params['session_id'])

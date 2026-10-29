@@ -71,7 +71,7 @@ def relay_turn(tmp_path, monkeypatch):
 @pytest.fixture()
 def worker_agent(tmp_path, monkeypatch):
     owner = _OwnerReplies()
-    monkeypatch.setattr(WorkerRPC, "_connection", lambda self: owner)
+    monkeypatch.setattr(WorkerRPC, "_connection", lambda self, deadline=None: owner)
     store = RuntimeSessionStore(WorkerRPC(tmp_path / "home"), {"session_id": SESSION}, tmp_path / "outbox")
     agent = SimpleNamespace(
         session_id=SESSION, _session_db=store, _last_activity_ts=0.0, _last_activity_desc="",
