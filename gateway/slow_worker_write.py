@@ -80,10 +80,7 @@ async def timed_worker_write(label: str, fn: Callable[..., Any], /, *args: Any,
         raise
     if done:
         return task.result()
-    try:
-        _report_slow(label, loop, submitted, running[0] if running else None)
-    except Exception:  # health: allow BLE001 -- observation must never change the write's outcome
-        logger.debug("Slow worker write report failed for %s", label, exc_info=True)
+    _quietly(_report_slow, label, loop, submitted, running[0] if running else None)
     ending = "finished"
     try:
         return await task
@@ -92,6 +89,18 @@ async def timed_worker_write(label: str, fn: Callable[..., Any], /, *args: Any,
         task.cancel()
         raise
     finally:
-        logger.warning("Slow worker write %s %s after %.1fs (%s)", label, ending,
-                       time.monotonic() - submitted,
-                       "started after %.1fs" % (running[0][0] - submitted) if running else "never started")
+        _quietly(_report_end, label, ending, submitted, running[0] if running else None)
+
+
+def _report_end(label: str, ending: str, submitted: float, running: Optional[tuple[float, int]]) -> None:
+    logger.warning("Slow worker write %s %s after %.1fs (%s)", label, ending, time.monotonic() - submitted,
+                   "started after %.1fs" % (running[0] - submitted) if running else "never started")
+
+
+def _quietly(report: Callable[..., None], *args: Any) -> None:
+    """Observation must never change the write's result, error or cancellation: not even a
+    logging handler that raises."""
+    try:
+        report(*args)
+    except Exception:  # health: allow BLE001 S110 -- the log itself failed; observation must never change the write's outcome
+        pass

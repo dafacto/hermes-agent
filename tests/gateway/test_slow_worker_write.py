@@ -170,15 +170,53 @@ def test_a_caller_that_stops_waiting_is_not_reported_as_finished(reports):
     assert "abandoned by its caller" in ending and "finished" not in ending
 
 
-def test_a_report_that_fails_leaves_the_write_untouched(monkeypatch, reports):
-    gate = threading.Event()
+class _Raising(logging.Handler):
+    """A logging handler that throws, and signals once a slow write was reported."""
 
-    def broken_report(*_):
-        gate.set()
-        raise RuntimeError("report failed")
+    def __init__(self):
+        super().__init__(logging.DEBUG)
+        self.seen = asyncio.Event()
 
-    monkeypatch.setattr(slow_worker_write, "_report_slow", broken_report)
-    assert asyncio.run(timed_worker_write("persist seq=1", lambda: gate.wait(20) and "stored", threshold_s=0.2)) == "stored"
+    def emit(self, record):
+        if "so far" in record.getMessage():
+            self.seen.set()
+        raise RuntimeError("handler failed")
+
+
+@pytest.fixture
+def raising_log(monkeypatch):
+    handler = _Raising()
+    log = logging.getLogger(LOGGER)
+    log.addHandler(handler)
+    monkeypatch.setattr(log, "level", logging.DEBUG)
+    yield handler
+    log.removeHandler(handler)
+
+
+def test_a_failing_report_keeps_the_writes_result_error_and_cancellation(raising_log):
+    def slow(outcome, gate):
+        gate.wait(20)
+        if outcome == "error":
+            raise ValueError("stale_generation")
+        return "stored"
+
+    async def scenario(outcome):
+        raising_log.seen = asyncio.Event()  # one per event loop
+        gate = threading.Event()
+        write = asyncio.ensure_future(timed_worker_write("persist seq=1", slow, outcome, gate, threshold_s=0.2))
+        try:
+            await asyncio.wait_for(raising_log.seen.wait(), timeout=20)
+            if outcome == "cancel":
+                write.cancel()
+        finally:
+            gate.set()
+        return await write
+
+    assert asyncio.run(scenario("result")) == "stored"
+    with pytest.raises(ValueError, match="stale_generation"):
+        asyncio.run(scenario("error"))
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(scenario("cancel"))
 
 
 def test_labels_never_carry_unvalidated_text():
