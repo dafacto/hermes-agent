@@ -26,6 +26,8 @@ ADMISSION_ANSWER_MARGIN_S = 60.0
 # 10 s gateway stall closed this socket and the submitter exited "Gateway connection failed",
 # booking a crash for a card whose run was still going. It reconnects and asks for the same
 # receipt (a read; the claim is never sent again) until an answer arrives, or none has for this long.
+# A soft bound, checked after each failure: counted from the last answer (or the first failure, before
+# any), and one back-off plus one reconnect attempt can run past it.
 RESULT_RECONNECT_S = 300.0
 _RECONNECT_BACKOFF_S = (0.5, 1.0, 2.0, 5.0)
 

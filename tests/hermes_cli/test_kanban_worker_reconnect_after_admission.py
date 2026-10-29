@@ -113,3 +113,15 @@ def test_it_gives_up_once_no_answer_has_come_for_the_reconnect_window(owner_conn
     with pytest.raises(GatewayClientError, match='Gateway disconnected'):
         run({'kanban.run': [{'session_id': 's1', 'receipt': _running()}], 'prompt.receipt': ['close']})
     assert [m for m, _ in sent] == ['kanban.run', 'prompt.receipt']  # no reconnect once the window is spent
+
+
+@pytest.mark.parametrize('lost', [OSError('connection reset'), TimeoutError(), 'closed'])
+def test_every_kind_of_lost_connection_after_admission_is_reconnected(owner_connections, lost):
+    from websockets.exceptions import ConnectionClosed
+    from websockets.frames import Close
+    run, sent = owner_connections
+    failure = ConnectionClosed(Close(1006, ''), None) if lost == 'closed' else lost
+    code = run({'kanban.run': [{'session_id': 's1', 'receipt': _running()}], 'prompt.receipt': ['close']},
+               failure, {'prompt.receipt': [_running('terminal')]})
+    assert code == 0
+    assert [m for m, _ in sent].count('kanban.run') == 1
