@@ -209,7 +209,17 @@ class DurableTurnLease:
 
         The holder-qualified UPDATE fences a late refresher from a successor lease. The façade's
         finally sets ``stop`` before releasing, so a holder-fenced miss observed after stop is not
-        a loss."""
+        a loss.
+
+        On a managed worker the renewal is an owner RPC: a lost receipt (owner stall, dropped link)
+        is resent inside the store until the authority is nearly spent, so one late reply is not a
+        lost lease; a refusal or a stall past that window still interrupts here. Every wait in that
+        renewal (the store's lock, the call's lock, redial, receipt, close) ends by its patience.
+
+        Independently, an ``_ExpiryGuard`` scheduled for ``authority - margin`` interrupts the turn
+        if the renewal is still out then, so a renewal blocked anywhere never keeps the turn running
+        into a successor's lease. A renewal that returns after the guard fired, or inside the
+        margin, gives no fresh authority: the turn stops."""
         if self.stop.is_set():
             return False
         started = time.time()
@@ -219,41 +229,110 @@ class DurableTurnLease:
         patience = self._authority_deadline - _REFRESH_EXPIRY_MARGIN_S - started
         if patience <= 0:
             return self._stop_on_exhausted_authority()
-        try:
-            if self.db.refresh_session_turn_lease(
-                self._current_session_id(), self.holder, ttl_seconds=LEASE_TTL_SECONDS,
-                patience_s=min(_REFRESH_WRITE_PATIENCE_S, patience),
-            ):
-                self._authority_deadline = started + LEASE_TTL_SECONDS
-                return None
-            if self.stop.is_set():
-                return False
-            logger.error(
-                "Lost session turn lease while turn is active: %s", self._current_session_id()
-            )
-            self._interrupt_turn("Session turn lease lost; stopping to protect the transcript.")
-        except Exception as exc:
-            if self.stop.is_set():
-                return False
-            from hermes_state_errors import is_sqlite_lock_error
+        # The store bounds the renewal by its patience, but the turn does not rely on that alone: an
+        # independent one-shot timer interrupts the turn at the expiry margin if the renewal is still
+        # out then (blocked on a lock, a socket, anything), before a successor can reclaim the row.
+        from agent.periodic_scheduler import schedule
 
-            if is_sqlite_lock_error(exc):
-                # The scheduler will not try again until one interval from now. If that attempt
-                # could not finish before the row expiry, stop before a successor can claim it.
-                if time.time() + self.refresh_interval + _REFRESH_EXPIRY_MARGIN_S >= self._authority_deadline:
-                    return self._stop_on_exhausted_authority()
-                logger.warning(
-                    "Session turn lease refresh hit a SQLite lock; will retry: %s",
-                    self._current_session_id(),
-                )
-                return None
-            logger.warning(
-                "Failed to refresh session turn lease: %s", self._current_session_id(), exc_info=True,
+        guard = _ExpiryGuard(self)
+        handle = schedule(guard.fire, max(0.0, self._authority_deadline - _REFRESH_EXPIRY_MARGIN_S - time.time()))
+        try:
+            return self._renew(started, patience, guard)
+        finally:
+            handle.cancel()
+
+    def _renew(self, started: float, patience: float, guard: "_ExpiryGuard"):
+        # A managed worker's store resends a renewal whose receipt an owner stall lost; it gets the
+        # whole remaining authority, so only a stall that outlasts the lease (or a refusal) ends it.
+        cap = getattr(type(self.db), "turn_lease_refresh_patience_cap_s", _REFRESH_WRITE_PATIENCE_S)
+        try:
+            renewed = self.db.refresh_session_turn_lease(
+                self._current_session_id(), self.holder, ttl_seconds=LEASE_TTL_SECONDS,
+                patience_s=min(cap, patience),
             )
-            self._interrupt_turn(
+        except Exception as exc:  # health: allow BLE001 -- every renewal failure decides the lease; _renewal_failed retries a SQLite lock or interrupts and logs exc_info
+            if guard.settle():
+                return False  # The guard already stopped the turn at the expiry margin.
+            return self._renewal_failed(exc)
+        if guard.settle():
+            # The turn was stopped at the expiry margin while this renewal was still out. Whatever
+            # it returned, it gives no fresh authority to a turn that has been interrupted.
+            logger.warning("Session turn lease renewal returned after its expiry margin: %s", self._current_session_id())
+            return False
+        if renewed:
+            if time.time() >= self._authority_deadline - _REFRESH_EXPIRY_MARGIN_S:
+                # Landed, but only once the old authority was inside its margin (the guard's timer
+                # hadn't run yet): too late to count as fresh authority.
+                logger.warning("Session turn lease renewal returned inside its expiry margin: %s",
+                               self._current_session_id())
+                self._interrupt_turn(
+                    "Session turn lease could not be refreshed; stopping to protect the transcript.")
+                return False
+            self._authority_deadline = started + LEASE_TTL_SECONDS
+            return None
+        if self.stop.is_set():
+            return False
+        logger.error(
+            "Lost session turn lease while turn is active: %s", self._current_session_id()
+        )
+        self._interrupt_turn("Session turn lease lost; stopping to protect the transcript.")
+        return False
+
+    def _renewal_failed(self, exc: Exception):
+        if self.stop.is_set():
+            return False
+        from hermes_state_errors import is_sqlite_lock_error
+
+        if is_sqlite_lock_error(exc):
+            # The scheduler will not try again until one interval from now. If that attempt
+            # could not finish before the row expiry, stop before a successor can claim it.
+            if time.time() + self.refresh_interval + _REFRESH_EXPIRY_MARGIN_S >= self._authority_deadline:
+                return self._stop_on_exhausted_authority()
+            logger.warning(
+                "Session turn lease refresh hit a SQLite lock; will retry: %s",
+                self._current_session_id(),
+            )
+            return None
+        logger.warning(
+            "Failed to refresh session turn lease: %s", self._current_session_id(), exc_info=True,
+        )
+        self._interrupt_turn(
+            "Session turn lease could not be refreshed; stopping to protect the transcript."
+        )
+        return False
+
+
+class _ExpiryGuard:
+    """One renewal's expiry guard: run once by the shared scheduler at the authority's expiry margin,
+    it interrupts the turn if that renewal is still out. ``settle`` (when the renewal returns) ends
+    the guard and says whether it already fired; from then on a late ``fire`` does nothing."""
+
+    def __init__(self, lease: DurableTurnLease) -> None:
+        self.lease = lease
+        self._lock = threading.Lock()
+        self._settled = False
+        self._fired = False
+
+    def fire(self) -> bool:
+        # The interrupt is issued under the guard's lock, so a renewal that settles meanwhile
+        # returns only once the turn has been told to stop.
+        with self._lock:
+            if self._settled:
+                return False
+            self._fired = True
+            logger.warning(
+                "Session turn lease renewal still out at its expiry margin; stopping the turn: %s",
+                self.lease._current_session_id(),
+            )
+            self.lease._interrupt_turn(
                 "Session turn lease could not be refreshed; stopping to protect the transcript."
             )
-        return False
+        return False  # One-shot.
+
+    def settle(self) -> bool:
+        with self._lock:
+            self._settled = True
+            return self._fired
 
 
 @dataclass

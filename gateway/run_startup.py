@@ -688,8 +688,8 @@ class GatewayStartupMixin:
         return True
 
     def _start_loop_liveness_guards(self, loop: asyncio.AbstractEventLoop) -> None:
-        """Arm the selector floor and out-of-loop watchdog before adapters. Disabled entirely with
-        ``gateway.loop_watchdog: false`` in config.yaml (config-only knob).
+        """Arm the selector floor, out-of-loop watchdog and lag reporter before adapters. Disabled
+        entirely with ``gateway.loop_watchdog: false`` in config.yaml (config-only knob).
 
         See #69089.
         """
@@ -718,12 +718,17 @@ class GatewayStartupMixin:
                 )
             except Exception:
                 logger.debug("Failed to start gateway loop liveness watchdog", exc_info=True)
+        lag = getattr(self, "_loop_lag_watchdog", None)
+        if lag is None or not lag.is_alive():
+            from gateway.loop_lag_watchdog import start_loop_lag_watchdog
+            self._loop_lag_watchdog = start_loop_lag_watchdog(loop)
 
     def _stop_loop_liveness_guards(self) -> None:
         """Disarm lifetime liveness guards before shutdown can load the loop — including the
         heartbeat writer, which would otherwise make a draining gateway look healthy to probes."""
         for attr, method, what in (
             ("_loop_liveness_watchdog", "stop", "stop gateway loop liveness watchdog"),
+            ("_loop_lag_watchdog", "stop", "stop gateway loop lag watchdog"),
             ("_loop_floor_timer_handle", "cancel", "cancel gateway loop floor timer"),
             ("_loop_heartbeat_task", "cancel", "cancel gateway loop heartbeat task"),
         ):
