@@ -15,6 +15,7 @@ import math
 import os
 from pathlib import Path
 import queue
+import socket
 import sys
 import threading
 import time
@@ -134,6 +135,13 @@ class _OwnerLink:
         self.replies = queue.SimpleQueue()
         self.reader = threading.Thread(target=self._read, name='worker-rpc-reader', daemon=True)
         self.reader.start()
+        # A send with a deadline: the watch cuts the socket if the owner hasn't taken the frame by
+        # then (websockets' sync send has no timeout of its own, and a socket timeout would also
+        # cut the library's reader). ``send_by`` is the deadline of the send under way, if any.
+        self.guard = threading.Condition()
+        self.send_by = None
+        self.cut = False
+        self.watch = None
 
     def _read(self):
         try:
@@ -147,9 +155,50 @@ class _OwnerLink:
         except Exception as exc:  # health: allow BLE001 -- handed to the caller, which raises it (ConnectionClosed included)
             self.replies.put(exc)
 
-    def send(self, request_id, message):
+    def send(self, request_id, message, deadline=None):
+        """Send one request; with ``deadline`` (monotonic) the send ends by then. A send still
+        blocked then (the owner not reading) is cut with the connection, never left running:
+        ``TimeoutError('worker_receipt_timeout')``, since part of the frame may have gone and only
+        the journal's exact retry may resend it."""
         self.awaiting = request_id
-        self.ws.send(message)
+        if deadline is None:
+            self.ws.send(message)
+            return
+        with self.guard:
+            if self.cut:
+                raise TimeoutError('worker_receipt_timeout')
+            self.send_by = deadline
+            if self.watch is None:
+                # health: allow HX012 -- watches this socket's send deadline; reads no profile-scoped state
+                self.watch = threading.Thread(target=self._watch, name='worker-rpc-send-watch', daemon=True)
+                self.watch.start()
+            self.guard.notify()
+        try:
+            self.ws.send(message)
+        except Exception as exc:  # health: allow BLE001 -- re-raised; only the cut's cause is renamed
+            with self.guard:
+                cut = self.cut
+            if cut:
+                raise TimeoutError('worker_receipt_timeout') from exc
+            raise
+        finally:
+            with self.guard:
+                self.send_by = None
+                self.guard.notify()
+
+    def _watch(self):
+        with self.guard:
+            while not self.cut and self.reader.is_alive():
+                if self.send_by is None:
+                    self.guard.wait(1.0)
+                    continue
+                left = self.send_by - time.monotonic()
+                if left > 0:
+                    self.guard.wait(left)
+                    continue
+                self.cut = True
+                with contextlib.suppress(OSError):  # already gone
+                    self.ws.socket.shutdown(socket.SHUT_RDWR)
 
     def receive(self, timeout):
         try:
@@ -181,7 +230,7 @@ class WorkerRPC:
                 return self.link
             # The owner closed it while idle, before any send: redial with a fresh ticket.
             self._drop(deadline)
-        from hermes_cli.gateway_client import _session_ticket, gateway_ws_target
+        from hermes_cli.gateway_client import GatewayClientError, _session_ticket, gateway_ws_target
         from hermes_cli.gateway_runtime_discovery import query_identify
         from websockets.sync.client import connect
         # A served secondary has no socket; its multiplexer's descriptor names it.
@@ -197,8 +246,14 @@ class WorkerRPC:
         descriptor = query_identify(control_home_for(self.home, endpoint), timeout=_wait_until(deadline, 5))
         if descriptor.get('pid') == os.getpid():
             raise WorkerPersistenceError('synchronous_self_rpc')
-        _wait_until(deadline, 5)  # The ticket's own control-socket waits are bounded inside it.
-        ticket = _session_ticket(self.home, endpoint, purpose='worker-adoption')
+        _wait_until(deadline, 5)
+        try:
+            ticket = _session_ticket(self.home, endpoint, purpose='worker-adoption', deadline=deadline)
+        except (GatewayClientError, OSError) as exc:
+            # Cut off by this call's deadline (not the owner's 5 s): nothing was sent.
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError('worker_call_deadline') from exc
+            raise
         url, protocols = gateway_ws_target(endpoint, ticket)
         # The owner is loopback, like connect_gateway's peer: an inherited HTTPS_PROXY must not carry it.
         # No library keepalive: its pong deadline would run independently of (and could fail) a call
@@ -226,7 +281,7 @@ class WorkerRPC:
     def call_by(self, deadline, method, /, **params):
         """One call that ends by ``deadline`` (monotonic; None: the receipt wait alone bounds it):
         the wait for this connection's lock, the redial (discovery, identify, ticket, open), the
-        receipt wait and the close are each cut to the time left. Out of time before sending, it
+        send, the receipt wait and the close are each cut to the time left. Out of time before sending, it
         raises ``TimeoutError('worker_call_deadline')``; after sending, a receipt that doesn't
         arrive in time is ``worker_receipt_timeout`` (lost: the owner may have applied it)."""
         try:
@@ -247,14 +302,14 @@ class WorkerRPC:
             try:
                 link = self._connection(deadline)
                 try:
-                    link.send(request_id, message)
+                    link.send(request_id, message, deadline)
                 except ConnectionClosed:
                     # websockets raises this from send only before a complete frame is written (closed
                     # on entry, or the socket write failed): the owner closed the link after the idle
                     # check and never saw this request, so redial and send it once more.
                     self._drop(deadline)
                     link = self._connection(deadline)
-                    link.send(request_id, message)
+                    link.send(request_id, message, deadline)
                 wait = _RECEIPT_TIMEOUT_S if deadline is None else max(
                     0.0, min(_RECEIPT_TIMEOUT_S, deadline - time.monotonic()))
                 response = link.receive(wait)
