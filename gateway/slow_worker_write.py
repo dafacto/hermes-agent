@@ -5,7 +5,8 @@ and the worker gives up on the reply after 20 s. On Lakpa (28 and 29 Oct 2026) t
 answered 20-50 s late at once, while the loop itself kept running, so the loop lag watchdog had
 nothing to report. This runs the same call, and once it has taken longer than the threshold logs
 how long it waited for a pool thread, how long it has run, how busy the default pool is and the
-running thread's stack (for example inside SQLite's busy wait), then how long it took in all.
+running thread's stack (for example inside SQLite's busy wait), then how it ended. A failure in
+the report itself never touches the write's result, error or cancellation.
 """
 from __future__ import annotations
 
@@ -15,7 +16,7 @@ import sys
 import threading
 import time
 import traceback
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -44,15 +45,31 @@ def _take_stack_slot(now: float) -> bool:
         return True
 
 
+def _report_slow(label: str, loop: asyncio.AbstractEventLoop, submitted: float,
+                 running: Optional[tuple[float, int]]) -> None:
+    now = time.monotonic()
+    waited = (running[0] if running else now) - submitted
+    ran = now - running[0] if running else 0.0
+    stack = ""
+    if running and _take_stack_slot(now):
+        frame = sys._current_frames().get(running[1])
+        if frame is not None:
+            stack = ("; running thread stack (most recent call last):\n"
+                     + "".join(traceback.format_stack(frame)[-_STACK_FRAMES:]).rstrip("\n"))
+    logger.warning("Slow worker write %s: %.1fs so far (waited %.1fs for a pool thread%s, ran %.1fs; %s)%s",
+                   label, now - submitted, waited, "" if running else ", still waiting", ran,
+                   _pool_state(loop), stack)
+
+
 async def timed_worker_write(label: str, fn: Callable[..., Any], /, *args: Any,
                              threshold_s: float = SLOW_WRITE_S, **kwargs: Any) -> Any:
     """``asyncio.to_thread(fn, *args, **kwargs)`` that reports itself past ``threshold_s``."""
     loop = asyncio.get_running_loop()
     submitted = time.monotonic()
-    state: dict[str, Any] = {}
+    running: list[tuple[float, int]] = []  # one (started, thread id), published in one append
 
     def run() -> Any:
-        state["started"], state["ident"] = time.monotonic(), threading.get_ident()
+        running.append((time.monotonic(), threading.get_ident()))
         return fn(*args, **kwargs)
 
     task = asyncio.ensure_future(asyncio.to_thread(run))
@@ -63,23 +80,18 @@ async def timed_worker_write(label: str, fn: Callable[..., Any], /, *args: Any,
         raise
     if done:
         return task.result()
-    now = time.monotonic()
-    started = state.get("started")
-    waited = (started if started is not None else now) - submitted
-    ran = now - started if started is not None else 0.0
-    stack = ""
-    if started is not None and _take_stack_slot(now):
-        frame = sys._current_frames().get(state["ident"])
-        if frame is not None:
-            stack = ("; running thread stack (most recent call last):\n"
-                     + "".join(traceback.format_stack(frame)[-_STACK_FRAMES:]).rstrip("\n"))
-    logger.warning("Slow worker write %s: %.1fs so far (waited %.1fs for a pool thread%s, ran %.1fs; %s)%s",
-                   label, now - submitted, waited, "" if started is not None else ", still waiting",
-                   ran, _pool_state(loop), stack)
+    try:
+        _report_slow(label, loop, submitted, running[0] if running else None)
+    except Exception:  # health: allow BLE001 -- observation must never change the write's outcome
+        logger.debug("Slow worker write report failed for %s", label, exc_info=True)
+    ending = "finished"
     try:
         return await task
+    except asyncio.CancelledError:
+        ending = "abandoned by its caller (a started write runs on)"
+        task.cancel()
+        raise
     finally:
-        started = state.get("started")
-        logger.warning("Slow worker write %s finished after %.1fs (waited %.1fs for a pool thread)",
-                       label, time.monotonic() - submitted,
-                       (started if started is not None else time.monotonic()) - submitted)
+        logger.warning("Slow worker write %s %s after %.1fs (%s)", label, ending,
+                       time.monotonic() - submitted,
+                       "started after %.1fs" % (running[0][0] - submitted) if running else "never started")

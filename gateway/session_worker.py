@@ -5,6 +5,7 @@ the owner on its parent's receipt stream (gateway/session_worker_child.py), neve
 """
 import hmac
 import os
+import re
 
 from gateway.session_admission import admission_fingerprint
 from gateway.slow_worker_write import timed_worker_write
@@ -62,10 +63,22 @@ def _verify(connection, ref, params, claim):
             raise RuntimeStoreError('permission_denied')
 
 
+_LABEL_PART = re.compile(r'[A-Za-z0-9_.:-]{1,64}')
+
+
+def _label_part(value):
+    """A label field as given when it is a short plain token, else '?': labels are formatted before
+    the write validates its fields, so they never carry arbitrary text or a newline into the log."""
+    text = str(value)
+    return text if _LABEL_PART.fullmatch(text) else '?'
+
+
 def _write_label(operation, params):
     """What a slow-write report names: never the claim, the payload or a secret."""
-    detail = f":{params['operation']} seq={params['sequence']}" if operation == 'persist' else ''
-    return f"{operation}{detail} execution={str(params.get('execution_id'))[:16]} session={str(params.get('session_id'))[:24]}"
+    detail = (f":{_label_part(params.get('operation'))} seq={_label_part(params.get('sequence'))}"
+              if operation == 'persist' else '')
+    return (f"{operation}{detail} execution={_label_part(params.get('execution_id'))[:16]}"
+            f" session={_label_part(params.get('session_id'))[:24]}")
 
 
 async def worker_request(connection, ref, params, *, operation):
