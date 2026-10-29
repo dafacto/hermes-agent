@@ -250,7 +250,7 @@ class DurableTurnLease:
                 self._current_session_id(), self.holder, ttl_seconds=LEASE_TTL_SECONDS,
                 patience_s=min(cap, patience),
             )
-        except Exception as exc:
+        except Exception as exc:  # health: allow BLE001 -- every renewal failure decides the lease; _renewal_failed retries a SQLite lock or interrupts and logs exc_info
             if guard.settle():
                 return False  # The guard already stopped the turn at the expiry margin.
             return self._renewal_failed(exc)
