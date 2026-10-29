@@ -257,6 +257,199 @@ def test_a_redial_that_finds_the_owner_still_stalled_keeps_resending(owner_db, f
         store.close()
 
 
+@pytest.fixture
+def short_margin(monkeypatch):
+    """The lease's 2 s expiry margin and 20 s receipt wait, scaled to 0.5 s and 2 s: wide enough for
+    the shared scheduler's wake-up slack on this host (a 0.05 s timer measured firing after 0.2 s), with
+    less time left in
+    each case than one receipt wait."""
+    from agent import turn_facade_lease
+    monkeypatch.setattr(turn_facade_lease, '_REFRESH_EXPIRY_MARGIN_S', 0.5)
+    monkeypatch.setattr(store_module, '_RECEIPT_TIMEOUT_S', 2.0)
+    monkeypatch.setattr(store_module, '_REDIAL_ALLOWANCE_S', 0.1)
+    monkeypatch.setattr(store_module, '_LOST_RECEIPT_BACKOFF_S', (0.05,))
+
+
+def _expiring_lease(store, owner_db_, interrupts, seconds):
+    """A held lease whose committed row expires ``seconds`` from now, as the lease believes."""
+    expiry = time.time() + seconds
+    owner_db_._write_sql('UPDATE session_turn_leases SET expires_at=?', (expiry,))
+    agent = SimpleNamespace(session_id='owned',
+                            interrupt=lambda message, **kwargs: interrupts.append((time.time(), message)))
+    lease = DurableTurnLease(agent, store, 'owned', HOLDER, expires_at=expiry)
+    lease.turn_active = True
+    return lease, expiry
+
+
+def test_less_time_left_than_one_receipt_wait_stops_the_turn_before_a_successor_can_take_it(
+        owner, short_margin, tmp_path):
+    """Reviewer's case (H5-1), real WebSocket owner and real lease rows: 1 s of authority left,
+    a 2 s receipt wait, and an owner that holds the renewal 3 s before committing. The renewal's
+    first send gets only what is left, so the turn is interrupted before the row expires, and the
+    successor that acquires after expiry finds the old renewal finished and its turn stopped. The
+    renewal stays pending and later resolves to its one stored receipt, under its own sequence."""
+    rpc = WorkerRPC(tmp_path)
+    store = RuntimeSessionStore(rpc, owner.scope, tmp_path / 'outbox')
+    interrupts = []
+    try:
+        assert store.try_acquire_session_turn_lease('owned', HOLDER) is True
+        lease, expiry = _expiring_lease(store, owner.db, interrupts, 1.0)
+        owner.stall, owner.stall_s = 'before_commit', 3.0
+        result = []
+        renewal = threading.Thread(target=lambda: result.append(lease.refresh_tick()))
+        renewal.start()
+        renewal.join(max(0.0, expiry - time.time()))
+        assert not renewal.is_alive(), 'the renewal was still out when the lease expired'
+        assert result == [False]
+        assert len(interrupts) == 1 and interrupts[0][0] < expiry
+        time.sleep(max(0.0, expiry - time.time()) + 0.03)  # health: allow HX013 -- past the real row expiry
+        assert owner.db.try_acquire_session_turn_lease('owned', 'pid=2:turn=successor:platform=kanban')
+        # The renewal is kept for recovery, exactly as sent, and nothing new was journaled after it.
+        assert store.failure == 'worker_receipt_timeout'
+        assert [entry['sequence'] for entry in store.journal['pending']] == [2]
+        assert store.journal['next_sequence'] == 3
+        assert owner.stalled_done.wait(10)  # The stalled owner commits it now: the holder fence refuses.
+        assert store.retry_pending()[0]['value'] is False
+        renewals = [sent for sent in owner.sent if sent[1] == 'turn.renew']
+        assert len(renewals) == 2 and renewals[0] == renewals[1] and renewals[0][0] == 2
+        assert _receipts(owner.db) == [1, 2]
+        assert store.journal['pending'] == [] and store.journal['next_sequence'] == 3
+        assert owner.db.session_turn_lease_expires_at('owned', HOLDER) is None
+    finally:
+        store.failure = None
+        store.journal['pending'] = []
+        store.close()
+        rpc.close()
+
+
+def test_a_store_lock_held_past_the_window_stops_the_turn_before_expiry_and_journals_nothing(
+        owner, short_margin, tmp_path):
+    """Another write holds the store's lock (as its own resends would): the renewal waits for it
+    only until its window ends, sends and journals nothing, and the turn stops before expiry."""
+    rpc = WorkerRPC(tmp_path)
+    store = RuntimeSessionStore(rpc, owner.scope, tmp_path / 'outbox')
+    interrupts = []
+    held, release = threading.Event(), threading.Event()
+
+    def hold():
+        with store.lock:
+            held.set()
+            release.wait(10)
+
+    holder = threading.Thread(target=hold)
+    try:
+        assert store.try_acquire_session_turn_lease('owned', HOLDER) is True
+        lease, expiry = _expiring_lease(store, owner.db, interrupts, 1.0)
+        holder.start()
+        assert held.wait(5)
+        assert lease.refresh_tick() is False
+        assert time.time() < expiry
+        assert len(interrupts) == 1 and interrupts[0][0] < expiry
+        release.set()
+        holder.join(5)
+        assert [sent[1] for sent in owner.sent] == ['turn.acquire']
+        assert store.failure is None and store.journal['pending'] == [] and store.journal['next_sequence'] == 2
+        time.sleep(max(0.0, expiry - time.time()) + 0.03)  # health: allow HX013 -- past the real row expiry
+        assert owner.db.try_acquire_session_turn_lease('owned', 'pid=2:turn=successor:platform=kanban')
+    finally:
+        release.set()
+        store.close()
+        rpc.close()
+
+
+def test_the_calls_own_lock_held_past_the_window_sends_nothing_and_keeps_the_entry(
+        owner, short_margin, tmp_path):
+    """The connection's lock (another call on it) is waited for only until the deadline. The entry
+    was journaled, so it stays pending and latched, and its later exact resend applies it once."""
+    rpc = WorkerRPC(tmp_path)
+    store = RuntimeSessionStore(rpc, owner.scope, tmp_path / 'outbox')
+    interrupts = []
+    try:
+        assert store.try_acquire_session_turn_lease('owned', HOLDER) is True
+        lease, expiry = _expiring_lease(store, owner.db, interrupts, 1.0)
+        with rpc.lock:
+            assert lease.refresh_tick() is False
+            assert time.time() < expiry
+        assert len(interrupts) == 1 and interrupts[0][0] < expiry
+        assert store.failure == 'worker_call_deadline'
+        assert [entry['sequence'] for entry in store.journal['pending']] == [2]
+        assert [sent[1] for sent in owner.sent] == ['turn.acquire']  # Never sent.
+        assert store.retry_pending()[0]['value'] is True  # Still its holder: the exact entry lands once.
+        assert _receipts(owner.db) == [1, 2] and store.journal['next_sequence'] == 3
+    finally:
+        store.failure = None
+        store.journal['pending'] = []
+        store.close()
+        rpc.close()
+
+
+def test_a_call_past_its_deadline_never_dials_or_sends(owner, tmp_path):
+    rpc = WorkerRPC(tmp_path)
+    try:
+        with pytest.raises(TimeoutError, match='worker_call_deadline'):
+            rpc.call_by(time.monotonic(), 'worker.persist', **owner.scope, sequence=1,
+                        operation='turn.renew', payload={'holder': HOLDER, 'ttl_seconds': 300.0})
+        assert owner.connections == 0 and owner.sent == []
+    finally:
+        rpc.close()
+
+
+class _BlockedStore:
+    """A store whose renewal ignores its patience and blocks until released, then answers ``True``."""
+    turn_lease_refresh_patience_cap_s = float('inf')
+
+    def __init__(self, delay=None):
+        self.release, self.delay, self.calls = threading.Event(), delay, []
+
+    def refresh_session_turn_lease(self, session_id, holder, *, ttl_seconds, patience_s):
+        self.calls.append(patience_s)
+        if self.delay is not None:
+            time.sleep(self.delay)  # health: allow HX013 -- a renewal that returns late
+        else:
+            self.release.wait(10)
+        return True
+
+
+def test_the_expiry_guard_stops_a_turn_whose_renewal_is_blocked_anywhere(short_margin):
+    """Independent of the store: a renewal that never honours its patience is still cut off at the
+    expiry margin, and its late success gives no fresh authority."""
+    store = _BlockedStore()
+    interrupts = []
+    agent = SimpleNamespace(session_id='owned',
+                            interrupt=lambda message, **kwargs: interrupts.append((time.time(), message)))
+    expiry = time.time() + 1.0
+    lease = DurableTurnLease(agent, store, 'owned', HOLDER, expires_at=expiry)
+    lease.turn_active = True
+    result = []
+    renewal = threading.Thread(target=lambda: result.append(lease.refresh_tick()))
+    renewal.start()
+    deadline = time.time() + 5
+    while not interrupts and time.time() < deadline:
+        time.sleep(0.01)  # health: allow HX013 -- waiting for the guard
+    assert len(interrupts) == 1 and interrupts[0][0] < expiry
+    assert renewal.is_alive()  # Still blocked: the guard, not the renewal, stopped the turn.
+    store.release.set()
+    renewal.join(5)
+    assert result == [False]
+    assert lease._authority_deadline == expiry  # The late success moved nothing.
+
+
+def test_a_renewal_that_returns_inside_the_margin_is_not_fresh_authority(short_margin, monkeypatch):
+    """The guard's timer not yet run (it is a separate thread): the timing check alone refuses it."""
+    from agent import periodic_scheduler
+    monkeypatch.setattr(periodic_scheduler, 'schedule',
+                        lambda fn, interval: SimpleNamespace(cancel=lambda wait=None: None))
+    store = _BlockedStore(delay=0.7)
+    interrupts = []
+    agent = SimpleNamespace(session_id='owned', interrupt=lambda message, **kwargs: interrupts.append(message))
+    expiry = time.time() + 1.0
+    lease = DurableTurnLease(agent, store, 'owned', HOLDER, expires_at=expiry)
+    lease.turn_active = True
+    assert lease.refresh_tick() is False
+    assert len(interrupts) == 1
+    assert lease._authority_deadline == expiry
+
+
 def test_a_closed_renewal_window_sends_nothing_and_latches_nothing(owner_db, tmp_path):
     db, scope = owner_db
     owner = _OwnerCalls(db, [])
