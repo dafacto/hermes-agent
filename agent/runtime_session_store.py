@@ -11,16 +11,44 @@ import contextvars
 from concurrent.futures import ThreadPoolExecutor
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import queue
 import sys
 import threading
+import time
 from hermes_dir_acl import make_user_dir
 
 logger = logging.getLogger(__name__)
 
 _worker_process = False
+
+# How long one owner call waits for its reply.
+_RECEIPT_TIMEOUT_S = 20.0
+# A resend redials first: discovery, identify, the ticket and the WebSocket open each wait up to 5 s.
+_REDIAL_ALLOWANCE_S = 20.0
+# How long one write keeps resending after its receipt was lost; a turn-lease renewal is given its
+# own window, ending before the lease expires.
+_LOST_RECEIPT_PATIENCE_S = 90.0
+_LOST_RECEIPT_BACKOFF_S = (0.5, 1.0, 2.0, 5.0)
+
+
+def _receipt_lost(exc):
+    """The owner may have applied the request, but its reply never arrived (it stalled past the
+    receipt wait, or the link dropped)."""
+    from websockets.exceptions import ConnectionClosed
+    return isinstance(exc, ConnectionClosed) or (
+        isinstance(exc, TimeoutError) and exc.args == ('worker_receipt_timeout',))
+
+
+def _owner_still_unreachable(exc):
+    """A resend's own failure that still only says the owner has not answered yet. Refusals the
+    owner sent (stale epoch or generation, permission, conflicts) are never in this set."""
+    from hermes_cli.gateway_client import GatewayClientError
+    return _receipt_lost(exc) or isinstance(exc, OSError) or (
+        isinstance(exc, WorkerPersistenceError) and str(exc) == 'owner_unavailable') or (
+        isinstance(exc, GatewayClientError) and str(exc) == 'Gateway bootstrap timed out')
 
 
 def is_worker_process():
@@ -194,9 +222,10 @@ class WorkerRPC:
                     self._drop()
                     link = self._connection()
                     link.send(request_id, message)
-                response = link.receive(20)
+                response = link.receive(_RECEIPT_TIMEOUT_S)
             except BaseException:
                 # Outcome unknown once sent: surface the error and never resend; the next call redials.
+                # Only the journal resends, as an exact retry of its pending entry (retry_pending).
                 self._drop()
                 raise
             if 'error' in response:
@@ -222,6 +251,9 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
     """
     # The process's async-delegation ledger belongs to the adopted execution, never a reserved child.
     binds_delegation_ledger = True
+    # A renewal here has no SQLite write lock to wait on; it waits for the owner's receipt and
+    # resends it after a lost one, so the lease lets it use all the time its authority has left.
+    turn_lease_refresh_patience_cap_s = math.inf
 
     def __init__(self, rpc, scope, outbox_dir, adopted=None, *, max_bytes=4 * 1024 * 1024):
         self.rpc = rpc
@@ -312,10 +344,15 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
         if session_id != self.scope['session_id']:
             raise WorkerPersistenceError('permission_denied')
 
-    def _apply(self, operation, payload):
+    def _apply(self, operation, payload, patience_s=None):
+        deadline = None if patience_s is None else time.monotonic() + patience_s
         with self.lock:
             if self.failure:
                 raise WorkerPersistenceError(self.failure)
+            if deadline is not None and time.monotonic() >= deadline:
+                # Another write's resends held the lock past this caller's window: nothing was
+                # journaled or sent, so nothing latches.
+                raise WorkerPersistenceError('receipt_window_closed')
             if self.journal['pending']:
                 raise WorkerPersistenceError('pending_receipt')
             entry = {'sequence': self.journal['next_sequence'], 'operation': operation, 'payload': payload}
@@ -328,15 +365,20 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
                 self.failure = str(exc)
                 raise
             self.journal = candidate
-            return self.retry_pending()[0]
+            return self.retry_pending(deadline=deadline)[0]
 
-    def retry_pending(self):
+    def retry_pending(self, *, deadline=None):
+        """Send the pending entries in order. A lost receipt resends the same entry (``_persist``)
+        until ``deadline`` (monotonic; default ``_LOST_RECEIPT_PATIENCE_S`` from now); any other
+        failure, or a lost receipt past the deadline, latches ``failure`` with the entry still pending."""
         with self.lock:
+            if deadline is None:
+                deadline = time.monotonic() + _LOST_RECEIPT_PATIENCE_S
             results = []
             try:
                 while self.journal['pending']:
                     entry = self.journal['pending'][0]
-                    result = self.rpc('worker.persist', **self.scope, **entry)
+                    result = self._persist(entry, deadline)
                     candidate = dict(self.journal, pending=self.journal['pending'][1:])
                     candidate = self._compression_receipt_journal(candidate, result)
                     self._save(candidate)
@@ -348,6 +390,32 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
                 raise
             self.failure = None
             return results
+
+    def _persist(self, entry, deadline):
+        """One entry's ``worker.persist``. After a lost receipt it is resent unchanged (same
+        sequence and payload) on a fresh connection: the owner answers an exact retry with the
+        receipt it stored for the first delivery, so the entry applies once however many sends it
+        took. A resend starts only while a full redial plus receipt wait still ends by ``deadline``."""
+        attempt = 0
+        while True:
+            try:
+                result = self.rpc('worker.persist', **self.scope, **entry)
+            except Exception as exc:
+                if not (_receipt_lost(exc) if attempt == 0 else _owner_still_unreachable(exc)):
+                    raise
+                pause = _LOST_RECEIPT_BACKOFF_S[min(attempt, len(_LOST_RECEIPT_BACKOFF_S) - 1)]
+                if time.monotonic() + pause + _REDIAL_ALLOWANCE_S + _RECEIPT_TIMEOUT_S > deadline:
+                    raise
+                attempt += 1
+                logger.warning('worker.persist %s seq=%s: no receipt (%s: %s); resending the same entry '
+                               '(attempt %d)', entry['operation'], entry['sequence'], type(exc).__name__,
+                               exc, attempt + 1)
+                time.sleep(pause)
+                continue
+            if attempt:
+                logger.warning('worker.persist %s seq=%s: receipt arrived on attempt %d',
+                               entry['operation'], entry['sequence'], attempt + 1)
+            return result
 
     def adopt(self, epoch):
         """Install only a separately verified worker.adopt result; never self-adopt."""
@@ -389,8 +457,11 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
             on_contended=on_contended)
 
     def refresh_session_turn_lease(self, session_id, holder, *, ttl_seconds=300.0, patience_s=None):
+        """``patience_s`` bounds the whole renewal, lost-receipt resends included: DurableTurnLease
+        passes the time left before its lease could expire (``turn_lease_refresh_patience_cap_s``)."""
         self._session(session_id)
-        return self._apply('turn.renew', {'holder': holder, 'ttl_seconds': ttl_seconds})['value']
+        return self._apply('turn.renew', {'holder': holder, 'ttl_seconds': ttl_seconds},
+                           patience_s=patience_s)['value']
 
     def release_session_turn_lease(self, session_id, holder):
         # DurableTurnLease retains its admission target across physical rotation.
