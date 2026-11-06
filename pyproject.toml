@@ -460,7 +460,7 @@ otlp = [
   "opentelemetry-sdk==1.45.1",
   "opentelemetry-exporter-otlp-proto-http==1.45.1",
 ]
-bedrock = ["boto3==1.43.115"]
+bedrock = ["boto3==1.43.117", "botocore==1.43.117"]
 vertex = ["google-auth==2.62.0"]
 azure-identity = ["azure-identity==1.26.0"]
 termux = [
