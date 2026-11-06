@@ -524,7 +524,7 @@ from cron.jobs import (
     clear_run_claim, get_due_jobs, heartbeat_fire_claim, heartbeat_run_claim, mark_job_run,
     save_job_output, self_removal_delivery_allowed, self_removal_delivery_scope, use_cron_store)
 from cron import store_health
-from cron.execution_identity import enter_cron_execution, exit_cron_execution
+from cron.execution_identity import enter_cron_execution, exit_cron_execution, queued_delivery_identity
 from cron.executions import (
     FIRER_FINISHED_STATES, _TERMINAL_STATES, HANDOFF_ADOPTION_GRACE_SECONDS, create_execution, finish_execution,
     get_execution, mark_execution_handoff_pending, mark_execution_running,
@@ -1363,10 +1363,9 @@ def drain_delivery_queue(adapters, loop) -> int:
     if not _path().exists():
         return 0
     def send(queued_job, queued_content, queued_for_failure):
-        error = _deliver_result(
-            queued_job, queued_content, adapters=adapters, loop=loop,
-            for_failure=queued_for_failure,
-        )
+        with queued_delivery_identity(queued_job):  # the queued send IS the fire's delivery
+            error = _deliver_result(queued_job, queued_content, adapters=adapters, loop=loop,
+                                    for_failure=queued_for_failure)
         # The ping left the process: book the incident alerted. A notice every target hid
         # (warning notifications suppressed) is a durable disposition, not an alert.
         if (not error and queued_for_failure
