@@ -44,7 +44,7 @@ def test_worker_rpc_reaches_loopback_owner_with_proxy_env(monkeypatch, tmp_path)
         monkeypatch.setattr(gateway_runtime, 'discover_gateway_endpoint',
                             lambda home, timeout: SimpleNamespace(state='ready', endpoint=endpoint))
         monkeypatch.setattr(discovery, 'query_identify', lambda home, timeout: {'pid': -1})
-        monkeypatch.setattr(gateway_client, '_session_ticket', lambda home, endpoint, purpose: 'ticket')
+        monkeypatch.setattr(gateway_client, '_session_ticket', lambda home, endpoint, purpose, deadline=None: 'ticket')
         for name in ('NO_PROXY', 'no_proxy', 'HTTP_PROXY', 'http_proxy', 'HTTPS_PROXY', 'https_proxy',
                      'ALL_PROXY', 'all_proxy'):
             monkeypatch.delenv(name, raising=False)

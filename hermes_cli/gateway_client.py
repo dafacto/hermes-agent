@@ -252,6 +252,8 @@ def private_control_query(home: Path, request: bytes, timeout: float = 5) -> byt
     from hermes_cli.gateway_runtime_discovery import connect_private
     deadline = time.monotonic() + timeout
     with connect_private(home, timeout) as peer:
+        # The send shares the query's one timeout: it never starts a fresh window of its own.
+        peer.settimeout(max(0.001, deadline - time.monotonic()))
         peer.sendall(request)
         data = bytearray()
         while b"\n" not in data:
@@ -270,8 +272,17 @@ def private_control_query(home: Path, request: bytes, timeout: float = 5) -> byt
 _UNKNOWN_TICKET_PARAMS = "PermissionError: invalid bootstrap parameters"
 
 
+def _ticket_wait(deadline) -> float:
+    """One ticket query's wait: 5 s, cut to what is left before the caller's ``deadline``."""
+    limit = 5.0 if deadline is None else min(5.0, deadline - time.monotonic())
+    if limit <= 0:
+        raise GatewayClientError("Gateway bootstrap timed out")
+    return limit
+
+
 def _session_ticket(home: Path, endpoint, *, purpose="interactive", scope=None, subject=None,
-                    refuse_restart_wait=False) -> str:
+                    refuse_restart_wait=False, deadline=None) -> str:
+    """``deadline`` (monotonic): the caller's own end, which the 5 s bootstrap wait never outlasts."""
     from hermes_cli.gateway_runtime import control_home_for
     from hermes_cli.gateway_runtime_discovery import _identify_response
     # A served secondary's ticket is minted by the multiplexer's socket, bound to the secondary.
@@ -283,14 +294,15 @@ def _session_ticket(home: Path, endpoint, *, purpose="interactive", scope=None, 
               **({"scope": scope} if scope else {}), **({"subject": subject} if subject else {}),
               **({"restart_wait": "refuse"} if refuse_restart_wait else {})}
     request = json.dumps({"protocol": 1, "id": 1, "verb": "session-ticket", "params": params}).encode() + b"\n"
-    answer = private_control_query(home, request)
+    answer = private_control_query(home, request, _ticket_wait(deadline))
     refused = json.loads(answer.split(b"\n", 1)[0]) if refuse_restart_wait else None
     if isinstance(refused, dict) and refused.get("error") == _UNKNOWN_TICKET_PARAMS:
         # An owner older than this client (the code on disk was updated under it) cannot hold the
         # policy; refusing it outright would strand the caller until it restarts. The pre-dial check stands.
         del params["restart_wait"]
         answer = private_control_query(home, json.dumps(
-            {"protocol": 1, "id": 1, "verb": "session-ticket", "params": params}).encode() + b"\n")
+            {"protocol": 1, "id": 1, "verb": "session-ticket", "params": params}).encode() + b"\n",
+            _ticket_wait(deadline))
     grant = _identify_response(answer)
     if any(grant.get(k) != v for k, v in {
         "profile_id": endpoint.profile_id, "instance_id": endpoint.instance_id, "runtime_protocol": 1,

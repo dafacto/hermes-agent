@@ -103,7 +103,7 @@ def owner(monkeypatch, owner_db):
         monkeypatch.setattr(gateway_runtime, 'discover_gateway_endpoint',
                             lambda home, timeout: SimpleNamespace(state='ready', endpoint=endpoint))
         monkeypatch.setattr(discovery, 'query_identify', lambda home, timeout: {'pid': -1})
-        monkeypatch.setattr(gateway_client, '_session_ticket', lambda home, endpoint, purpose: 'ticket')
+        monkeypatch.setattr(gateway_client, '_session_ticket', lambda home, endpoint, purpose, deadline=None: 'ticket')
         try:
             yield state
         finally:

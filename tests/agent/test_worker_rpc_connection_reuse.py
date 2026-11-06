@@ -95,7 +95,7 @@ def owner(monkeypatch, tmp_path):
         ws.close()
         state.closed.set()
 
-    def ticket(home, endpoint, purpose):
+    def ticket(home, endpoint, purpose, deadline=None):
         assert purpose == 'worker-adoption'
         state.tickets += 1
         return f'ticket-{state.tickets}'
