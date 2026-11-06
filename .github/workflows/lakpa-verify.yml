@@ -1,0 +1,70 @@
+# Verification of the frozen PR #9 head (dafacto/hermes-agent#9) on a GitHub-hosted runner.
+# Lives only on branch ci/lakpa-v0.23-verify; never merged, never part of the PR. The code under
+# test is the pinned SHA below (asserted), not this branch's own commit.
+name: Lakpa v0.23 verify (pinned head)
+on:
+  push:
+    branches: [ci/lakpa-v0.23-verify]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: lakpa-v0.23-verify
+  cancel-in-progress: false
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      PINNED: f614c593069e6df42127b54e825ad2864da9509e
+      V023: 2bd378ed1b8d6bf2192cb26e0a55ff3091e6bd19
+      HERMES_DISABLE_LAZY_INSTALLS: '1'
+    steps:
+      - name: Check out the pinned head (not this branch)
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+        with:
+          ref: f614c593069e6df42127b54e825ad2864da9509e
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Tested tree is exactly the pinned head
+        run: |
+          test "$(git rev-parse HEAD)" = "$PINNED"
+          git diff --quiet "$PINNED"
+          git cat-file -e "$V023^{commit}"
+          echo "tested_sha=$(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Set up the PM toolchain and isolated test environment (as upstream tests.yml)
+        uses: ./.github/actions/setup-pm
+        with:
+          extras: '["all", "anthropic", "bedrock", "mistral", "fal", "modal", "daytona", "parallel-web", "keychain"]'
+          test-environment: 'true'
+
+      - name: Bedrock pin and CA bundle in the test environment
+        run: |
+          "$HERMES_PYTHON" -I -c 'import botocore,boto3,os;pem=open(os.path.join(os.path.dirname(botocore.__file__),"cacert.pem")).read();assert botocore.__version__==boto3.__version__=="1.43.117",(botocore.__version__,boto3.__version__);assert "AAA Certificate Services" not in pem;print("boto3/botocore",botocore.__version__,"AAA fallback absent")'
+
+      - name: Ported regression tests
+        run: scripts/run_tests.sh -j 4 tests/cron/test_queued_delivery_identity.py tests/agent/test_worker_lost_receipt_lease.py tests/agent/test_worker_rpc_call_deadline.py
+
+      - name: S1 cron (tests/cron + gateway cron; Linux adds the restart-safe worker E2E)
+        run: scripts/run_tests.sh -j 4 tests/cron tests/gateway/test_cron_*.py
+
+      - name: S2 lease / runtime session store / worker RPC
+        run: |
+          scripts/run_tests.sh -j 4 tests/agent/test_activity_persist_off_relay_loop.py tests/agent/test_cross_process_turn_lease.py \
+            tests/agent/test_periodic_scheduler*.py tests/agent/test_runtime_session_store*.py tests/agent/test_turn_facade_lease.py \
+            tests/agent/test_turn_lease_frees_by_refcount.py tests/agent/test_side_question_lease.py tests/agent/test_session_activity_persist.py \
+            tests/agent/test_compression_terminal_activity_persist.py tests/agent/test_worker_*.py tests/gateway/test_worker_*.py \
+            tests/gateway/test_lost_worker_receipt_compaction.py
+
+      - name: S3 kanban worker client / gateway client / control socket
+        run: |
+          scripts/run_tests.sh -j 4 tests/hermes_cli/test_kanban_worker_*.py tests/hermes_cli/test_gateway_client_*.py \
+            tests/hermes_cli/test_web_server_session_owner_forward.py tests/gateway/test_control_socket*.py
+
+      - name: Install pinned lint tools (as upstream lint.yml)
+        run: python -m scripts.ci.python_packages "$(python -m scripts.code_health --print-pins)"
+
+      - name: Lint and code-health ratchet against v0.23.0 (scripts/check)
+        run: python scripts/check --base "$V023"
